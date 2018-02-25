@@ -23,6 +23,7 @@
  */
 
 #include <linux/oom.h>
+#include <linux/jiffies.h>
 #include <linux/shmem_fs.h>
 #include <linux/slab.h>
 #include <linux/swap.h>
@@ -351,7 +352,7 @@ i915_gem_shrinker_scan(struct shrinker *shrinker, struct shrink_control *sc)
 		container_of(shrinker, struct drm_i915_private, mm.shrinker);
 	unsigned long freed;
 	bool unlock;
-
+	
 	sc->nr_scanned = 0;
 
 	if (!shrinker_lock(i915, &unlock))
@@ -416,6 +417,7 @@ i915_gem_shrinker_oom(struct notifier_block *nb, unsigned long event, void *ptr)
 		container_of(nb, struct drm_i915_private, mm.oom_notifier);
 	struct drm_i915_gem_object *obj;
 	unsigned long unevictable, bound, unbound, freed_pages;
+	static unsigned long disabled_until64 = 0;
 
 	freed_pages = i915_gem_shrink_all(i915);
 
@@ -448,7 +450,21 @@ i915_gem_shrinker_oom(struct notifier_block *nb, unsigned long event, void *ptr)
 		       "bound and unbound GPU page lists.\n",
 		       bound, unbound);
 
-	*(unsigned long *)ptr += freed_pages;
+	if (0 == disabled_until64 || get_jiffies_64() - disabled_until64 > 0) {
+		*(unsigned long *)ptr += freed_pages;
+		/*
+		 * Disable this code path for about 10 seconds to avoid live
+		 * hang due freeing and allocating GPU memory all the time
+		 * instead of activating OOM killer
+		 */
+		disabled_until64 = get_jiffies_64() + (10 << SHIFT_HZ);
+		pr_info("i915: Disabling GPU memory freeing to avoid OOM killer until %lu.\n",
+			disabled_until64);
+	}
+	else {
+		pr_info("i915: Reporting zero freed pages to kernel to avoid live hang due OOM.\n");
+	}
+		
 	return NOTIFY_DONE;
 }
 
