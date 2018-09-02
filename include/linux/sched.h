@@ -590,6 +590,22 @@ struct wake_q_node {
 	struct wake_q_node *next;
 };
 
+struct memalloc_info {
+	/* Is current thread doing (nested) memory allocation? */
+	u8 in_flight;
+	/* Watchdog kernel thread is about to report this task? */
+	bool report;
+	/* Index used for memalloc_in_flight[] counter. */
+	u8 idx;
+	/* For progress monitoring. */
+	unsigned int sequence;
+	/* Started time in jiffies as of in_flight == 1. */
+	unsigned long start;
+	/* Requested order and gfp flags as of in_flight == 1. */
+	unsigned int order;
+	gfp_t gfp;
+};
+
 struct task_struct {
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 	/*
@@ -1186,6 +1202,9 @@ struct task_struct {
 	 */
 	randomized_struct_fields_end
 
+#ifdef CONFIG_DETECT_MEMALLOC_STALL_TASK
+	struct memalloc_info		memalloc; //TODO: unsure if I should add this above 'randomized_struct_fields_end'
+#endif
 	/* CPU-specific state of this task: */
 	struct thread_struct		thread;
 

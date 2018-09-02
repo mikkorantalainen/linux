@@ -4346,6 +4346,76 @@ static inline void finalise_ac(gfp_t gfp_mask, struct alloc_context *ac)
 					ac->high_zoneidx, ac->nodemask);
 }
 
+#ifdef CONFIG_DETECT_MEMALLOC_STALL_TASK
+
+static DEFINE_PER_CPU_ALIGNED(int, memalloc_in_flight[2]);
+static u8 memalloc_active_index; /* Either 0 or 1. */
+
+/* Called periodically with sysctl_memalloc_task_warning_secs interval. */
+bool memalloc_maybe_stalling(void)
+{
+	int cpu;
+	int sum = 0;
+	const u8 idx = memalloc_active_index ^ 1;
+
+	for_each_online_cpu(cpu)
+		sum += per_cpu(memalloc_in_flight[idx], cpu);
+	if (sum)
+		return true;
+	memalloc_active_index ^= 1;
+	return false;
+}
+
+void start_memalloc_timer(const gfp_t gfp_mask, const int order)
+{
+	struct memalloc_info *m = &current->memalloc;
+
+	/* We don't check for stalls for !__GFP_DIRECT_RECLAIM allocations. */
+	if (!(gfp_mask & __GFP_DIRECT_RECLAIM))
+		return;
+	/* Record the beginning of memory allocation request. */
+	if (!m->in_flight) {
+		m->sequence++;
+		m->start = jiffies;
+		m->order = order;
+		m->gfp = gfp_mask;
+		m->idx = memalloc_active_index;
+		/*
+		 * is_stalling_task() depends on ->in_flight being updated
+		 * after ->start is stored.
+		 */
+		smp_wmb();
+		this_cpu_inc(memalloc_in_flight[m->idx]);
+	}
+	m->in_flight++;
+}
+
+void stop_memalloc_timer(const gfp_t gfp_mask)
+{
+	struct memalloc_info *m = &current->memalloc;
+
+	if ((gfp_mask & __GFP_DIRECT_RECLAIM) && !--m->in_flight)
+		this_cpu_dec(memalloc_in_flight[m->idx]);
+}
+
+static void memalloc_counter_fold(int cpu)
+{
+	int counter;
+	u8 idx;
+
+	for (idx = 0; idx < 2; idx++) {
+		counter = per_cpu(memalloc_in_flight[idx], cpu);
+		if (!counter)
+			continue;
+		this_cpu_add(memalloc_in_flight[idx], counter);
+		per_cpu(memalloc_in_flight[idx], cpu) = 0;
+	}
+}
+
+#else
+#define memalloc_counter_fold(cpu) do { } while (0)
+#endif
+
 /*
  * This is the 'heart' of the zoned buddy allocator.
  */
@@ -4386,7 +4456,9 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
 	if (unlikely(ac.nodemask != nodemask))
 		ac.nodemask = nodemask;
 
+	start_memalloc_timer(alloc_mask, order);
 	page = __alloc_pages_slowpath(alloc_mask, order, &ac);
+	stop_memalloc_timer(alloc_mask);
 
 out:
 	if (memcg_kmem_enabled() && (gfp_mask & __GFP_ACCOUNT) && page &&
@@ -7060,6 +7132,12 @@ static int page_alloc_cpu_dead(unsigned int cpu)
 	 * race with what we are doing.
 	 */
 	cpu_vm_stats_fold(cpu);
+
+	/*
+	 * Zero the in-flight counters of the dead processor so that
+	 * memalloc_maybe_stalling() needs to check only online processors.
+	 */
+	memalloc_counter_fold(cpu);
 	return 0;
 }
 
